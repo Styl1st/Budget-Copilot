@@ -1,0 +1,10 @@
+// Cloudflare reads this file every time you push (Workers & Pages → budget-copilot → Builds).
+// It deploys ONLY the AI tutor in worker/worker.js. The site itself stays on GitHub Pages.
+// Secrets (GEMINI_API_KEY, ACCESS_CODE) live in the Cloudflare dashboard, never in this repo.
+{
+  "name": "budget-copilot",
+  "main": "worker/worker.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "keep_vars": true
+}

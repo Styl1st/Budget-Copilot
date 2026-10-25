@@ -1,10 +1,7 @@
-# Only needed if you deploy from the command line (npx wrangler deploy).
+# Not needed if Cloudflare builds from GitHub: it uses wrangler.jsonc at the root of the repo.
+# Only for a manual deploy from this folder: npx wrangler deploy
 # Secrets: npx wrangler secret put GEMINI_API_KEY   and   npx wrangler secret put ACCESS_CODE
-name = "budget-copilot-tutor"
+name = "budget-copilot"
 main = "worker.js"
-compatibility_date = "2026-10-01"
-
-[vars]
-ALLOWED_ORIGINS = "https://styl1st.github.io"
-# MODEL = "gemini-3.8-flash"
-# FALLBACK_MODEL = "gemini-3.5-flash-lite"
+compatibility_date = "2026-09-01"
+keep_vars = true

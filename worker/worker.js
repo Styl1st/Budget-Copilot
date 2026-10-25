@@ -5,9 +5,14 @@
  * as a secret, adds the course knowledge as the system prompt, and streams Gemini's answer back
  * (converted to the small event format the chat bubble reads).
  *
+ * Two ways to chat:
+ *   - with the owner's key: the bubble sends the access code (X-Access-Code), the Worker uses GEMINI_API_KEY;
+ *   - with your own key (friends): the bubble sends that key (X-Gemini-Key), the Worker uses it for this
+ *     request only and never stores it. Each friend then has their own free quota.
+ *
  * Cloudflare dashboard → your Worker → Settings → Variables and Secrets:
- *   GEMINI_API_KEY   (secret, required)  free key from https://aistudio.google.com
- *   ACCESS_CODE      (secret, recommended) a password: only people who type it in the bubble can chat
+ *   GEMINI_API_KEY   (secret, optional)  your free key from https://aistudio.google.com
+ *   ACCESS_CODE      (secret, recommended) a password: only people who type it can use GEMINI_API_KEY
  *   ALLOWED_ORIGINS  (optional) comma-separated, default "https://styl1st.github.io"
  *   MODEL            (optional) default "gemini-3.8-flash"
  *   FALLBACK_MODEL   (optional) default "gemini-3.5-flash-lite", used when the first one hits its free quota
@@ -36,7 +41,7 @@ function cors(origin) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Access-Code',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Access-Code, X-Gemini-Key',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };
@@ -45,10 +50,10 @@ function json(status, obj, origin) {
   return new Response(JSON.stringify(obj), { status, headers: Object.assign({ 'Content-Type': 'application/json' }, origin ? cors(origin) : {}) });
 }
 
-function gemini(env, model, payload) {
+function gemini(apiKey, model, payload) {
   return fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':streamGenerateContent?alt=sse', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify(payload)
   });
 }
@@ -89,8 +94,13 @@ export default {
     if (request.method === 'GET') return new Response('Budget Copilot AI tutor is running.', { status: 200 });
     if (request.method !== 'POST') return json(405, { error: 'method' });
     if (!ok) return json(403, { error: 'origin', message: 'This site is not allowed to use the tutor.' });
-    if (!env.GEMINI_API_KEY) return json(500, { error: 'config', message: 'The tutor has no API key yet.' }, origin);
-    if (env.ACCESS_CODE && request.headers.get('X-Access-Code') !== env.ACCESS_CODE) return json(401, { error: 'code', message: 'This tutor is private: enter the access code.' }, origin);
+    const own = (request.headers.get('X-Gemini-Key') || '').trim();
+    if (own && !/^[\w-]{20,120}$/.test(own)) return json(401, { error: 'key', message: 'That does not look like a Gemini API key. Paste it again.' }, origin);
+    if (!own) {
+      if (!env.GEMINI_API_KEY) return json(401, { error: 'code', message: 'To chat, paste your own free Gemini API key below.' }, origin);
+      if (env.ACCESS_CODE && request.headers.get('X-Access-Code') !== env.ACCESS_CODE) return json(401, { error: 'code', message: 'To chat, paste your free Gemini API key below, or the access code if you have one.' }, origin);
+    }
+    const apiKey = own || env.GEMINI_API_KEY;
 
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
     if (limited(ip)) return json(429, { error: 'rate', message: 'Too many questions in a short time. Wait a few minutes.' }, origin);
@@ -123,15 +133,17 @@ export default {
       generationConfig: { maxOutputTokens: MAX_TOKENS, temperature: 0.4 }
     };
     const first = env.MODEL || DEFAULT_MODEL, second = env.FALLBACK_MODEL || DEFAULT_FALLBACK;
-    let up = await gemini(env, first, payload);
-    if ((up.status === 429 || up.status === 503 || up.status === 404) && second && second !== first) up = await gemini(env, second, payload);
+    let up = await gemini(apiKey, first, payload);
+    if ((up.status === 429 || up.status === 503 || up.status === 404) && second && second !== first) up = await gemini(apiKey, second, payload);
 
     if (!up.ok || !up.body) {
       let detail = '';
       try { detail = (await up.json()).error.message; } catch (e) { /* ignore */ }
-      const msg = up.status === 400 && /API key/i.test(detail) ? 'The Gemini API key is not valid.'
+      const badKey = (up.status === 400 && /API key/i.test(detail)) || up.status === 401 || (up.status === 403 && /API key|PERMISSION_DENIED|not enabled|disabled/i.test(detail));
+      if (own && badKey) return json(401, { error: 'key', message: 'Google refused this Gemini API key. Check it in AI Studio and paste it again.' }, origin);
+      const msg = badKey ? 'The Gemini API key is not valid.'
         : up.status === 403 ? 'The Gemini API key is not allowed to use this model.'
-        : up.status === 429 ? 'The free Gemini quota is used up for now. It resets every day: try again later.'
+        : up.status === 429 ? (own ? 'Your free Gemini quota is used up for now. It resets every day: try again later.' : 'The free Gemini quota is used up for now. It resets every day: try again later.')
         : up.status === 503 ? 'Gemini is overloaded. Try again in a minute.'
         : 'The AI could not answer.';
       return json(502, { error: 'upstream', status: up.status, message: msg, detail }, origin);
