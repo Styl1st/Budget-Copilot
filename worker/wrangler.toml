@@ -1,0 +1,10 @@
+# Only needed if you deploy from the command line (npx wrangler deploy).
+# Secrets: npx wrangler secret put GEMINI_API_KEY   and   npx wrangler secret put ACCESS_CODE
+name = "budget-copilot-tutor"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+ALLOWED_ORIGINS = "https://styl1st.github.io"
+# MODEL = "gemini-3.8-flash"
+# FALLBACK_MODEL = "gemini-3.5-flash-lite"
