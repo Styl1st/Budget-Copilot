@@ -18,7 +18,8 @@ Two ways to unlock the bubble:
   | Claude | paid | https://console.anthropic.com/settings/keys | `claude-haiku-5-5` |
 
   The key's prefix picks the AI automatically (`AQ.`/`AIza`, `gsk_`, `sk-or-`, `sk-ant-`, `sk-`).
-  "Model" in the bubble lets you type another model name if a default ever disappears.
+  "Connect" checks the key by listing the models it can use (free, it does not spend any quota), and
+  the model menu at the top of the chat shows that list. "Your AI" also accepts any other model name.
 - **The access code** (for you): choose "Access code", type the code you chose, and the Worker uses
   your Gemini key (`GEMINI_API_KEY`).
 

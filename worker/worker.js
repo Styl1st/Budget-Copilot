@@ -49,7 +49,7 @@ function cors(origin) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Access-Code, X-Provider, X-Api-Key, X-Model, X-Gemini-Key',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Access-Code, X-Provider, X-Api-Key, X-Model, X-Gemini-Key, X-Check',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };
@@ -85,6 +85,29 @@ function callAI(p, key, model, msgs, origin) {
   const headers = { 'content-type': 'application/json', 'authorization': 'Bearer ' + key };
   if (p === PROVIDERS.openrouter) { headers['HTTP-Referer'] = origin; headers['X-Title'] = 'Budget Copilot'; }
   return fetch(p.url, { method: 'POST', headers, body: JSON.stringify(body) });
+}
+
+/* Key check for the bubble's "Connect" button: lists the models this key can use. Listing models is
+   free on every provider, so checking a key never spends the student's quota. */
+const LISTS = {
+  gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', prefer: /flash(?!-lite)/,
+    pick: j => (j.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name.replace(/^models\//, '')).filter(id => /gemini/.test(id) && !/embed|image|tts|live|audio|robotics|computer|native|vision/.test(id)) },
+  groq: { url: 'https://api.groq.com/openai/v1/models', prefer: /70b|120b/, pick: j => (j.data || []).map(m => m.id).filter(id => !/whisper|guard|tts|orpheus|playai|distil|compound/.test(id)) },
+  mistral: { url: 'https://api.mistral.ai/v1/models', prefer: /small-latest/, pick: j => (j.data || []).filter(m => !m.capabilities || m.capabilities.completion_chat).map(m => m.id).filter(id => !/embed|moderation|ocr|transcri|voxtral/.test(id)) },
+  openrouter: { url: 'https://openrouter.ai/api/v1/key', prefer: /free/, pick: () => ['openrouter/free'] },
+  openai: { url: 'https://api.openai.com/v1/models', prefer: /mini/, pick: j => (j.data || []).map(m => m.id).filter(id => /^(gpt-|o\d|chatgpt)/.test(id) && !/audio|realtime|tts|transcribe|image|search|embed|instruct|moderation|codex|dall|preview/.test(id)) },
+  anthropic: { url: 'https://api.anthropic.com/v1/models?limit=100', prefer: /haiku/, pick: j => (j.data || []).map(m => m.id) }
+};
+async function checkKey(pid, p, key) {
+  const L = LISTS[pid];
+  const headers = p.kind === 'gemini' ? { 'x-goog-api-key': key } : p.kind === 'anthropic' ? { 'x-api-key': key, 'anthropic-version': '2023-06-01' } : { authorization: 'Bearer ' + key };
+  const res = await fetch(L.url, { headers });
+  if (!res.ok) return { status: res.status, detail: await errorDetail(res) };
+  let ids = [];
+  try { ids = L.pick(await res.json()); } catch (e) { /* keep the default model */ }
+  ids = [...new Set(ids)].sort((a, b) => b.localeCompare(a, 'en', { numeric: true })).slice(0, 60);
+  const best = ids.includes(p.model) ? p.model : (ids.find(id => L.prefer.test(id)) || ids[0] || p.model);
+  return { ok: true, model: best, models: [best].concat(ids.filter(id => id !== best)) };
 }
 
 /* Upstream SSE → the events the bubble reads: content_block_delta / error / message_stop. */
@@ -163,6 +186,15 @@ export default {
 
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
     if (limited(ip + (own ? ':own' : ''), own ? RATE.ownMax : RATE.max)) return json(429, { error: 'rate', message: 'Too many questions in a short time. Wait a few minutes.' }, origin);
+
+    if (h('X-Check')) {
+      if (!own) return json(200, { ok: true, provider: 'gemini', model, models: [model] }, origin);
+      const r = await checkKey(pid, p, key);
+      if (r.ok) return json(200, { ok: true, provider: pid, model: r.model, models: r.models }, origin);
+      const refused = r.status === 401 || r.status === 403 || (r.status === 400 && /api[ _-]?key|credential|authenticat/i.test(r.detail));
+      if (refused) return json(401, { error: 'key', status: r.status, message: p.name + ' refused this API key' + (r.detail ? ' (' + r.detail.slice(0, 140) + ')' : '') + '.' }, origin);
+      return json(200, { ok: true, provider: pid, model: p.model, models: [p.model], warn: p.name + ' could not list models (' + r.status + ').' }, origin);
+    }
 
     let body;
     try { body = await request.json(); } catch (e) { return json(400, { error: 'json' }, origin); }
