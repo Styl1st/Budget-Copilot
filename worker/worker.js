@@ -1,47 +1,55 @@
 /**
- * Budget Copilot · AI tutor proxy (Cloudflare Worker) · Google Gemini, free tier.
+ * Budget Copilot · AI tutor proxy (Cloudflare Worker).
  *
- * The site (GitHub Pages) cannot hold an API key: anyone could read it. This Worker keeps the key
- * as a secret, adds the course knowledge as the system prompt, and streams Gemini's answer back
- * (converted to the small event format the chat bubble reads).
+ * The site (GitHub Pages) cannot hold an API key: anyone could read it. This Worker adds the course
+ * knowledge as the system prompt, calls the AI and streams the answer back (converted to the small
+ * event format the chat bubble reads).
  *
  * Two ways to chat:
- *   - with the owner's key: the bubble sends the access code (X-Access-Code), the Worker uses GEMINI_API_KEY;
- *   - with your own key (friends): the bubble sends that key (X-Gemini-Key), the Worker uses it for this
- *     request only and never stores it. Each friend then has their own free quota.
+ *   - bring your own key: the bubble sends X-Provider (gemini, groq, mistral, openrouter, openai,
+ *     anthropic), X-Api-Key and optionally X-Model. The key is used for this request only, never stored.
+ *   - the owner's key: the bubble sends the access code (X-Access-Code), the Worker uses GEMINI_API_KEY.
  *
- * Cloudflare dashboard → your Worker → Settings → Variables and Secrets:
- *   GEMINI_API_KEY   (secret, optional)  your free key from https://aistudio.google.com
- *   ACCESS_CODE      (secret, recommended) a password: only people who type it can use GEMINI_API_KEY
- *   ALLOWED_ORIGINS  (optional) comma-separated, default "https://styl1st.github.io"
- *   MODEL            (optional) default "gemini-3.8-flash"
- *   FALLBACK_MODEL   (optional) default "gemini-3.5-flash-lite", used when the first one hits its free quota
+ * Cloudflare dashboard → your Worker → Settings → Variables and Secrets (all optional):
+ *   GEMINI_API_KEY   (secret) the owner's free key from https://aistudio.google.com
+ *   ACCESS_CODE      (secret) a password: only people who type it can use GEMINI_API_KEY
+ *   ALLOWED_ORIGINS  comma-separated, default "https://styl1st.github.io"
+ *   MODEL            default "gemini-3.8-flash" (owner's key)
+ *   FALLBACK_MODEL   default "gemini-3.5-flash-lite", used when Gemini's free quota is used up
  */
 
 const DEFAULT_ORIGINS = 'https://styl1st.github.io';
-const DEFAULT_MODEL = 'gemini-3.8-flash';
-const DEFAULT_FALLBACK = 'gemini-3.5-flash-lite';
 const MAX_TURNS = 12;            // messages kept from the conversation
 const MAX_CHARS = 4000;          // per message
 const MAX_CONTEXT = 14000;       // page context sent by the site
-const MAX_TOKENS = 2048;         // answer length (thinking models count their reasoning here too)
-const RATE = { max: 20, windowMs: 10 * 60 * 1000 };   // per IP, per Worker instance
+const MAX_TOKENS = 2048;         // answer length
+const RATE = { max: 20, ownMax: 60, windowMs: 10 * 60 * 1000 };   // per IP, per Worker instance (own keys: friends on one school Wi-Fi share an IP)
+
+/* Every AI the bubble can use. kind = which API shape it speaks. */
+const PROVIDERS = {
+  gemini: { name: 'Gemini', kind: 'gemini', model: 'gemini-3.8-flash', fallback: 'gemini-3.5-flash-lite' },
+  groq: { name: 'Groq', kind: 'openai', url: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-3.3-70b-versatile' },
+  mistral: { name: 'Mistral', kind: 'openai', url: 'https://api.mistral.ai/v1/chat/completions', model: 'mistral-small-latest' },
+  openrouter: { name: 'OpenRouter', kind: 'openai', url: 'https://openrouter.ai/api/v1/chat/completions', model: 'openrouter/free' },
+  openai: { name: 'OpenAI', kind: 'openai', url: 'https://api.openai.com/v1/chat/completions', model: 'gpt-5-mini', reasoning: true },
+  anthropic: { name: 'Claude', kind: 'anthropic', url: 'https://api.anthropic.com/v1/messages', model: 'claude-haiku-5-5' }
+};
 
 const hits = new Map();
-function limited(ip) {
+function limited(ip, max) {
   const now = Date.now();
   const list = (hits.get(ip) || []).filter(t => now - t < RATE.windowMs);
   list.push(now);
   hits.set(ip, list);
   if (hits.size > 5000) hits.clear();
-  return list.length > RATE.max;
+  return list.length > max;
 }
 
 function cors(origin) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Access-Code, X-Gemini-Key',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Access-Code, X-Provider, X-Api-Key, X-Model, X-Gemini-Key',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };
@@ -50,28 +58,59 @@ function json(status, obj, origin) {
   return new Response(JSON.stringify(obj), { status, headers: Object.assign({ 'Content-Type': 'application/json' }, origin ? cors(origin) : {}) });
 }
 
-function gemini(apiKey, model, payload) {
-  return fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':streamGenerateContent?alt=sse', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
-    body: JSON.stringify(payload)
-  });
+/* One upstream call, in the shape each API expects. msgs = [{role: 'user'|'assistant', content}]. */
+function callAI(p, key, model, msgs, origin) {
+  if (p.kind === 'gemini') {
+    return fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':streamGenerateContent?alt=sse', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM }] },
+        contents: msgs.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+        generationConfig: { maxOutputTokens: MAX_TOKENS, temperature: 0.4 }
+      })
+    });
+  }
+  if (p.kind === 'anthropic') {
+    return fetch(p.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model, system: SYSTEM, messages: msgs, max_tokens: MAX_TOKENS, temperature: 0.4, stream: true })
+    });
+  }
+  // OpenAI-compatible: OpenAI, Groq, Mistral, OpenRouter
+  const body = { model, stream: true, messages: [{ role: 'system', content: SYSTEM }].concat(msgs) };
+  if (p.reasoning) body.max_completion_tokens = 4 * MAX_TOKENS;   // reasoning models: no temperature, reasoning counts here
+  else { body.max_tokens = MAX_TOKENS; body.temperature = 0.4; }
+  const headers = { 'content-type': 'application/json', 'authorization': 'Bearer ' + key };
+  if (p === PROVIDERS.openrouter) { headers['HTTP-Referer'] = origin; headers['X-Title'] = 'Budget Copilot'; }
+  return fetch(p.url, { method: 'POST', headers, body: JSON.stringify(body) });
 }
 
-/* Gemini SSE chunks → the events the bubble reads: content_block_delta / error / message_stop. */
-function translate(stream) {
+/* Upstream SSE → the events the bubble reads: content_block_delta / error / message_stop. */
+function translate(stream, kind) {
   const dec = new TextDecoder(), enc = new TextEncoder();
   let buf = '';
   const emit = (ctrl, obj) => ctrl.enqueue(enc.encode('event: ' + obj.type + '\ndata: ' + JSON.stringify(obj) + '\n\n'));
+  const text = (ctrl, t) => { if (t) emit(ctrl, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: t } }); };
+  const fail = (ctrl, m) => emit(ctrl, { type: 'error', error: { message: m || 'error' } });
   const handle = (ctrl, block) => {
     for (const line of block.split('\n')) {
       if (!line.startsWith('data:')) continue;
-      let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
-      if (ev.error) { emit(ctrl, { type: 'error', error: { message: ev.error.message || 'error' } }); continue; }
-      if (ev.promptFeedback && ev.promptFeedback.blockReason) { emit(ctrl, { type: 'error', error: { message: 'question blocked (' + ev.promptFeedback.blockReason + ')' } }); continue; }
-      const parts = (ev.candidates && ev.candidates[0] && ev.candidates[0].content && ev.candidates[0].content.parts) || [];
-      const text = parts.filter(p => !p.thought).map(p => p.text || '').join('');
-      if (text) emit(ctrl, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
+      const data = line.slice(5).trim();
+      if (!data || data === '[DONE]') continue;
+      let ev; try { ev = JSON.parse(data); } catch (e) { continue; }
+      if (ev.error) { fail(ctrl, ev.error.message || String(ev.error)); continue; }
+      if (kind === 'gemini') {
+        if (ev.promptFeedback && ev.promptFeedback.blockReason) { fail(ctrl, 'question blocked (' + ev.promptFeedback.blockReason + ')'); continue; }
+        const parts = (ev.candidates && ev.candidates[0] && ev.candidates[0].content && ev.candidates[0].content.parts) || [];
+        text(ctrl, parts.filter(x => !x.thought).map(x => x.text || '').join(''));
+      } else if (kind === 'anthropic') {
+        if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') text(ctrl, ev.delta.text);
+      } else {
+        const d = ev.choices && ev.choices[0] && ev.choices[0].delta;
+        if (d && typeof d.content === 'string') text(ctrl, d.content);
+      }
     }
   };
   return stream.pipeThrough(new TransformStream({
@@ -84,6 +123,14 @@ function translate(stream) {
   }));
 }
 
+async function errorDetail(res) {
+  try {
+    const t = await res.text();
+    try { const j = JSON.parse(t); const e = Array.isArray(j) ? j[0] && j[0].error : j.error; return String((e && (e.message || e)) || j.message || j.detail || t).slice(0, 300); }
+    catch (e) { return t.slice(0, 300); }
+  } catch (e) { return ''; }
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') || '';
@@ -94,16 +141,28 @@ export default {
     if (request.method === 'GET') return new Response('Budget Copilot AI tutor is running.', { status: 200 });
     if (request.method !== 'POST') return json(405, { error: 'method' });
     if (!ok) return json(403, { error: 'origin', message: 'This site is not allowed to use the tutor.' });
-    const own = (request.headers.get('X-Gemini-Key') || '').trim();
-    if (own && !/^[\w-]{20,120}$/.test(own)) return json(401, { error: 'key', message: 'That does not look like a Gemini API key. Paste it again.' }, origin);
-    if (!own) {
-      if (!env.GEMINI_API_KEY) return json(401, { error: 'code', message: 'To chat, paste your own free Gemini API key below.' }, origin);
-      if (env.ACCESS_CODE && request.headers.get('X-Access-Code') !== env.ACCESS_CODE) return json(401, { error: 'code', message: 'To chat, paste your free Gemini API key below, or the access code if you have one.' }, origin);
+
+    // Who pays for this answer: the visitor's own key, or the owner's key behind the access code.
+    const h = n => (request.headers.get(n) || '').trim();
+    let pid = h('X-Provider').toLowerCase(), key = h('X-Api-Key');
+    if (!key && h('X-Gemini-Key')) { pid = 'gemini'; key = h('X-Gemini-Key'); }   // older version of the bubble
+    const own = !!key;
+    let p, model;
+    if (own) {
+      p = PROVIDERS[pid];
+      if (!p) return json(401, { error: 'key', message: 'Pick an AI in the list.' }, origin);
+      if (!/^[\w.\-]{16,300}$/.test(key)) return json(401, { error: 'key', message: 'That does not look like a ' + p.name + ' API key. Paste it again.' }, origin);
+      const m = h('X-Model');
+      if (m && !/^[\w.:\/\-]{1,100}$/.test(m)) return json(400, { error: 'model', message: 'That model name is not valid.' }, origin);
+      model = m || p.model;
+    } else {
+      if (!env.GEMINI_API_KEY) return json(401, { error: 'code', message: 'To chat, pick an AI below and paste your own API key.' }, origin);
+      if (env.ACCESS_CODE && h('X-Access-Code') !== env.ACCESS_CODE) return json(401, { error: 'code', message: 'To chat, pick an AI below and paste your own API key, or the access code if you have one.' }, origin);
+      p = PROVIDERS.gemini; key = env.GEMINI_API_KEY; model = env.MODEL || p.model;
     }
-    const apiKey = own || env.GEMINI_API_KEY;
 
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-    if (limited(ip)) return json(429, { error: 'rate', message: 'Too many questions in a short time. Wait a few minutes.' }, origin);
+    if (limited(ip + (own ? ':own' : ''), own ? RATE.ownMax : RATE.max)) return json(429, { error: 'rate', message: 'Too many questions in a short time. Wait a few minutes.' }, origin);
 
     let body;
     try { body = await request.json(); } catch (e) { return json(400, { error: 'json' }, origin); }
@@ -127,28 +186,24 @@ export default {
       last.content = '<page_context>\n' + context + '\n</page_context>\n\n' + last.content;
     }
 
-    const payload = {
-      systemInstruction: { parts: [{ text: SYSTEM }] },
-      contents: clean.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
-      generationConfig: { maxOutputTokens: MAX_TOKENS, temperature: 0.4 }
-    };
-    const first = env.MODEL || DEFAULT_MODEL, second = env.FALLBACK_MODEL || DEFAULT_FALLBACK;
-    let up = await gemini(apiKey, first, payload);
-    if ((up.status === 429 || up.status === 503 || up.status === 404) && second && second !== first) up = await gemini(apiKey, second, payload);
+    let up = await callAI(p, key, model, clean, origin);
+    // Gemini's free quota is per model: switch to the lighter one when the first is used up.
+    const second = own ? p.fallback : (env.FALLBACK_MODEL || p.fallback);
+    if (p.kind === 'gemini' && !h('X-Model') && [429, 503, 404].includes(up.status) && second && second !== model) up = await callAI(p, key, second, clean, origin);
 
     if (!up.ok || !up.body) {
-      let detail = '';
-      try { detail = (await up.json()).error.message; } catch (e) { /* ignore */ }
-      const badKey = (up.status === 400 && /API key/i.test(detail)) || up.status === 401 || (up.status === 403 && /API key|PERMISSION_DENIED|not enabled|disabled/i.test(detail));
-      if (own && badKey) return json(401, { error: 'key', message: 'Google refused this Gemini API key. Check it in AI Studio and paste it again.' }, origin);
-      const msg = badKey ? 'The Gemini API key is not valid.'
-        : up.status === 403 ? 'The Gemini API key is not allowed to use this model.'
-        : up.status === 429 ? (own ? 'Your free Gemini quota is used up for now. It resets every day: try again later.' : 'The free Gemini quota is used up for now. It resets every day: try again later.')
-        : up.status === 503 ? 'Gemini is overloaded. Try again in a minute.'
-        : 'The AI could not answer.';
-      return json(502, { error: 'upstream', status: up.status, message: msg, detail }, origin);
+      const s = up.status, detail = await errorDetail(up);
+      const badKey = s === 401 || (s === 400 && /api[ _-]?key|credential|authenticat/i.test(detail)) || (s === 403 && /api[ _-]?key|permission|denied|not enabled|disabled|unauthori[sz]ed/i.test(detail));
+      if (badKey) return json(401, { error: own ? 'key' : 'upstream', status: s, message: p.name + ' refused this API key' + (detail ? ' (' + detail.slice(0, 140) + ')' : '') + '. Check it and paste it again.', detail }, origin);
+      const msg = s === 404 ? p.name + ' does not know the model "' + model + '". Pick another model.'
+        : s === 413 ? 'This question is too big for this model\'s free limit. Untick "Copilot sees" or pick another model.'
+        : s === 429 ? (own ? 'Your ' + p.name + ' quota or rate limit is reached. Wait a bit, or try again tomorrow.' : 'The free Gemini quota is used up for now. It resets every day: try again later.')
+        : s === 402 ? 'No credit left on this ' + p.name + ' account.'
+        : s === 503 || s === 529 ? p.name + ' is overloaded. Try again in a minute.'
+        : p.name + ' could not answer (' + s + ')' + (detail ? ': ' + detail : '.');
+      return json(502, { error: 'upstream', status: s, message: msg, detail }, origin);
     }
-    return new Response(translate(up.body), { status: 200, headers: Object.assign({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' }, cors(origin)) });
+    return new Response(translate(up.body, p.kind), { status: 200, headers: Object.assign({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' }, cors(origin)) });
   }
 };
 
